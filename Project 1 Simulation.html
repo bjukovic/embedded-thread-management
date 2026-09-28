@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Thread Scheduler Simulator — Stable RR</title>
+  <style>
+    :root {
+      --bg: #0f172a; --panel: #111827; --text: #e5e7eb; --accent: #60a5fa; --accent-2: #34d399; --accent-3: #f472b6; --idle:#6b7280; --blocked:#9ca3af; --cpu:#fbbf24;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font:15px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,"Helvetica Neue",Arial}
+    header{padding:18px 22px;background:linear-gradient(180deg,#0b1023,transparent);border-bottom:1px solid #111827}
+    h1{margin:0 0 4px;font-size:18px}
+    .wrap{max-width:1100px;margin:0 auto;padding:18px 16px 40px}
+    .controls{display:grid;grid-template-columns:1fr auto auto auto auto;gap:10px;align-items:center;padding:12px;background:var(--panel);border:1px solid #1f2937;border-radius:14px}
+    .group{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    select,button,input[type=number],input[type=range]{background:#0b1222;color:var(--text);border:1px solid #22304f;border-radius:10px;padding:8px 10px;font:inherit}
+    button{cursor:pointer}
+    .legend{display:flex;gap:16px;flex-wrap:wrap;padding:10px 12px;margin-top:12px;background:var(--panel);border:1px solid #1f2937;border-radius:14px}
+    .key{display:inline-flex;gap:8px;align-items:center;font-size:12px}
+    .swatch{width:14px;height:14px;border-radius:4px;border:1px solid #00000040}
+    .grid{margin-top:14px;display:grid;gap:12px}
+    .lane{background:var(--panel);border:1px solid #1f2937;border-radius:14px;padding:10px}
+    .lane h3{margin:0 0 8px;font-size:13px;letter-spacing:.6px}
+    .timeline{display:grid;grid-auto-flow:column;grid-auto-columns:14px;gap:3px;align-items:center;min-height:28px}
+    .tick{width:14px;height:20px;border-radius:4px;background:#0b1222;border:1px solid #22304f}
+    .tick.cpu{background:var(--cpu)}
+    .t1{background:var(--accent)} .t2{background:var(--accent-2)} .t3{background:var(--accent-3)}
+    .blocked{background:var(--blocked)} .idle{background:var(--idle)}
+    .footer{margin-top:16px;opacity:.8;font-size:12px;text-align:center}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Thread Scheduler Simulator</h1>
+    <div class="sub">Sequential (one thread makes progress) vs Parallel (true round‑robin with quantum). I/O sleeps tick concurrently only in parallel.</div>
+  </header>
+ 
+  <div class="wrap">
+    <div class="controls">
+      <div class="group"><label for="mode">Mode</label>
+        <select id="mode">
+          <option value="parallel">Parallel (RR)</option>
+          <option value="sequential">Sequential</option>
+        </select>
+      </div>
+      <div class="group"><label for="quantum">Quantum</label>
+        <input type="number" id="quantum" value="3" min="1" max="10" style="width:64px" />
+      </div>
+      <div class="group" style="min-width:220px"><label for="speed">Speed</label>
+        <input type="range" id="speed" min="50" max="800" value="200" />
+      </div>
+      <div class="group"><button id="start">▶ Start</button><button id="pause">⏸ Pause</button></div>
+      <div class="group"><button id="reset">⟲ Reset</button></div>
+    </div>
+ 
+    <div class="legend">
+      <span class="key"><span class="swatch t1"></span>T1</span>
+      <span class="key"><span class="swatch t2"></span>T2</span>
+      <span class="key"><span class="swatch t3"></span>T3</span>
+      <span class="key"><span class="swatch blocked"></span>Blocked (I/O)</span>
+      <span class="key"><span class="swatch idle"></span>CPU Idle</span>
+      <span class="key"><span class="swatch" style="background:var(--cpu)"></span>CPU Owner</span>
+    </div>
+ 
+    <div class="grid">
+      <div class="lane"><h3>CPU</h3><div class="timeline" id="cpu"></div></div>
+      <div class="lane"><h3>T1</h3><div class="timeline" id="t1"></div></div>
+      <div class="lane"><h3>T2</h3><div class="timeline" id="t2"></div></div>
+      <div class="lane"><h3>T3</h3><div class="timeline" id="t3"></div></div>
+    </div>
+ 
+    <div class="footer">Parallel RR: holds CPU for <em>quantum</em> ticks; on slice end or block/finish, thread requeues to tail. Sequential: only the active thread progresses; others are frozen.</div>
+  </div>
+ 
+  <script>
+    // ---------- Utilities ----------
+    const timelines = { cpu: document.getElementById('cpu'), 1: document.getElementById('t1'), 2: document.getElementById('t2'), 3: document.getElementById('t3') };
+    const modeSel = document.getElementById('mode');
+    const quantumInput = document.getElementById('quantum');
+    const speedInput = document.getElementById('speed');
+    const startBtn = document.getElementById('start');
+    const pauseBtn = document.getElementById('pause');
+    const resetBtn = document.getElementById('reset');
+ 
+    function addTick(el, clsArr=[]) { const d=document.createElement('div'); d.className='tick '+clsArr.join(' '); el.appendChild(d); d.scrollIntoView({inline:'end',block:'nearest'}); }
+ 
+    function deepCopy(o){ return JSON.parse(JSON.stringify(o)); }
+ 
+    // ---------- Workload ----------
+    const TEMPLATE = [
+      { id:1, color:'t1', bursts:[ {type:'cpu',len:5},{type:'io',len:3},{type:'cpu',len:4},{type:'io',len:2},{type:'cpu',len:3} ] },
+      { id:2, color:'t2', bursts:[ {type:'cpu',len:3},{type:'io',len:4},{type:'cpu',len:6} ] },
+      { id:3, color:'t3', bursts:[ {type:'cpu',len:4},{type:'io',len:2},{type:'cpu',len:2},{type:'io',len:3},{type:'cpu',len:2} ] },
+    ];
+ 
+    // ---------- State ----------
+    let threads, clock, isRunning, intervalId;
+    let readyQ, current, quantumLeft; // for parallel
+    let activeIdx; // for sequential
+ 
+    function reset(){
+      threads = deepCopy(TEMPLATE).map(t=>({...t, ptr:0, sleepLeft:0, done:false, enq:false }));
+      clock=0; isRunning=false; current=null; readyQ=[]; activeIdx=0; quantumLeft=parseInt(quantumInput.value)||3;
+      clearInterval(intervalId);
+      Object.values(timelines).forEach(el=>el.innerHTML='');
+      // seed ready queue with initial CPU bursts
+      for (const t of threads){ if (t.bursts[t.ptr]?.type==='cpu') enqueue(t); }
+    }
+ 
+    function everyoneDone(){ return threads.every(t=>t.done || t.ptr>=t.bursts.length); }
+ 
+    // ---------- Ready Queue ----------
+    function enqueue(t){ if (!t || t.enq) return; readyQ.push(t); t.enq=true; }
+    function dequeue(){ const t=readyQ.shift(); if (t) t.enq=false; return t; }
+ 
+    // ---------- Parallel (RR) ----------
+    function tickIO_All(){
+      // I/O progresses for all threads; return list of threads that FINISH I/O this tick
+      const woke = [];
+      for (const t of threads){
+        if (t.done) continue;
+        const b=t.bursts[t.ptr];
+        if (!b) { t.done=true; continue; }
+        if (b.type==='io'){
+          if (t.sleepLeft===0) t.sleepLeft=b.len; // enter I/O
+          t.sleepLeft -= 1;
+          addTick(timelines[t.id], ['blocked']); // exactly one paint for this tick
+          if (t.sleepLeft===0){
+            t.ptr += 1; // move to next burst after finishing I/O
+            const nb=t.bursts[t.ptr];
+            if (!nb) { t.done=true; }
+            else if (nb.type==='cpu') woke.push(t); // ready NEXT tick, not this one
+          }
+        }
+      }
+      return woke;
+    }
+ 
+    function step_parallel(){
+      const Q = parseInt(quantumInput.value)||3;
+      // 1) I/O advances for everyone; collect threads that just woke from I/O
+      const wokeThisTick = new Set(tickIO_All());
+ 
+      // 2) If CPU is free, fetch next ready (excluding newly-woken threads this tick)
+      if (!current){ current = dequeue(); if (current) quantumLeft=Q; }
+ 
+      let ran=null;
+      if (!current){
+        addTick(timelines.cpu, ['idle','cpu']);
+      } else {
+        const b=current.bursts[current.ptr];
+        if (!b || b.type!=='cpu'){
+          current=null; addTick(timelines.cpu, ['idle','cpu']);
+        } else {
+          addTick(timelines.cpu, ['cpu', current.color]);
+          b.len -= 1; quantumLeft -= 1; ran=current;
+          addTick(timelines[current.id], ['running', current.color]);
+          if (b.len===0){
+            current.ptr += 1; if (!current.bursts[current.ptr]) current.done=true;
+            const nb=current.bursts[current.ptr];
+            if (nb && nb.type==='cpu') enqueue(current); // will be eligible next pick
+            current=null; quantumLeft=Q;
+          } else if (quantumLeft===0){
+            enqueue(current); current=null; quantumLeft=Q;
+          }
+        }
+      }
+ 
+      // 3) Alignment cells for READY-but-not-running (exclude newly-woken threads this tick)
+      for (const t of threads){
+        if (t===ran || t.done) continue;
+        if (wokeThisTick.has(t)) continue; // they already drew a blocked cell this tick
+        const b=t.bursts[t.ptr];
+        if (b && b.type==='cpu' && !t.enq && t!==current) {
+          // If not enqueued yet but CPU burst, they must be newly switched from CPU to IO in this tick — handled above.
+          // Only draw alignment for threads that are READY and not running. A thread is READY if it has CPU burst and is enqueued.
+        }
+        if (b && b.type==='cpu' && (t.enq || t===current)){
+          if (t!==ran && t!==current) addTick(timelines[t.id], []);
+        }
+      }
+ 
+      // 4) After painting this tick, append newly-woken threads to the tail of the ready queue
+      for (const t of wokeThisTick) enqueue(t);
+ 
+      clock+=1; if (everyoneDone()) pause();
+    }
+ 
+    // ---------- Sequential ----------
+    function activeSequential(){
+      while (activeIdx<threads.length && (threads[activeIdx].done || threads[activeIdx].ptr>=threads[activeIdx].bursts.length)) activeIdx++;
+      return threads[activeIdx]||null;
+    }
+ 
+    function step_sequential(){
+      const act=activeSequential();
+      if (!act){ addTick(timelines.cpu, ['idle','cpu']); clock++; if (everyoneDone()) pause(); return; }
+      // freeze others
+      for (const t of threads){ if (t!==act && !t.done) addTick(timelines[t.id], []); }
+      const b=act.bursts[act.ptr];
+      if (!b){ act.done=true; addTick(timelines.cpu, ['idle','cpu']); clock++; return; }
+      if (b.type==='io'){
+        if (act.sleepLeft===0) act.sleepLeft=b.len; act.sleepLeft -= 1;
+        addTick(timelines[act.id], ['blocked']); addTick(timelines.cpu, ['idle','cpu']);
+        if (act.sleepLeft===0){ act.ptr += 1; if (!act.bursts[act.ptr]) act.done=true; }
+      } else {
+        b.len -= 1; addTick(timelines.cpu, ['cpu', act.color]); addTick(timelines[act.id], ['running', act.color]);
+        if (b.len===0){ act.ptr += 1; if (!act.bursts[act.ptr]) act.done=true; }
+      }
+      clock++; if (everyoneDone()) pause();
+    }
+ 
+    // ---------- Driver ----------
+    function step(){ if (modeSel.value==='parallel') step_parallel(); else step_sequential(); }
+    function start(){ if (isRunning) return; isRunning=true; intervalId=setInterval(step, parseInt(speedInput.value)||200); }
+    function pause(){ isRunning=false; clearInterval(intervalId); }
+ 
+    startBtn.addEventListener('click', start);
+    pauseBtn.addEventListener('click', pause);
+    resetBtn.addEventListener('click', reset);
+    speedInput.addEventListener('input', ()=>{ if (!isRunning) return; clearInterval(intervalId); intervalId=setInterval(step, parseInt(speedInput.value)||200); });
+    modeSel.addEventListener('change', reset);
+    quantumInput.addEventListener('change', ()=>{ quantumLeft=parseInt(quantumInput.value)||3; });
+ 
+    reset();
+  </script>
+</body>
+</html>
+ 
+ 
